@@ -1,0 +1,95 @@
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform-Action to Execute'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened, closed]
+
+jobs:
+  terraform:
+    name: Terraform ${{ github.event_name == 'workflow_dispatch' && inputs.action || (github.event_name == 'pull_request' && 'Plan/Apply') }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+
+    env:
+      TERRAFORM_DIR: ${{ github.workspace }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::157125373921:role/GithubActionsDeployments
+          aws-region: ap-south-1
+
+      - id: init
+        name: Run terraform init
+        run: terraform init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+
+      - id: validate
+        name: Run terraform validate
+        run: terraform validate
+        working-directory: ${{ env.TERRAFORM_DIR }}
+
+      - id: plan
+        name: Run terraform plan
+        if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' || (github.event_name == 'workflow_dispatch' && inputs.action == 'plan') }}
+        run: |
+          set +e;
+          terraform plan -input=false -out=tfplan -detailed-exitcode;
+          PLAN_EXITCODE=$?;
+          echo "exitcode=$PLAN_EXITCODE" | tee -a $GITHUB_OUTPUT;
+
+          terraform show -no-color tfplan > plan_output.txt
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            PLAN_COMMENT=$(cat plan_output.txt | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+            curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            -d "{\"body\": \"**Terraform Plan Output:**\n\n\`\`\`\n$PLAN_COMMENT\n\`\`\`\"}"
+          fi
+
+          if [[ $PLAN_EXITCODE == 2 ]];
+          then
+            exit 0;
+          else
+            exit $PLAN_EXITCODE;
+          fi
+        working-directory: ${{ env.TERRAFORM_DIR }}
+
+      - id: apply
+        name: Run terraform apply
+        if: ${{ (github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true) || (github.event_name == 'workflow_dispatch' && inputs.action == 'apply') }}
+        run: |
+          terraform plan -input=false -out=tfplan
+          terraform apply -auto-approve -input=false tfplan;
+        working-directory: ${{ env.TERRAFORM_DIR }}
+
+      - name: Clean up plan file
+        if: ${{ ((github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true) || (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')) && success() }}
+        run: rm -f tfplan
+        working-directory: ${{ env.TERRAFORM_DIR }}
