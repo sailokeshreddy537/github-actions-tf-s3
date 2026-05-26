@@ -2,7 +2,7 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: 'Terraform-Action to Execute'
+        description: 'Terraform-Actions to Execute'
         required: true
         default: 'plan'
         type: choice
